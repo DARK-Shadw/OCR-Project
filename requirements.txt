@@ -1,5 +1,8 @@
 easyocr
 opencv-python
-Flask
+flask
 pytesseract
-Pillow
+pillow
+pdf2image
+poppler-utils
+fuzzywuzzy
