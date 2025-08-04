@@ -6,3 +6,6 @@ pillow
 pdf2image
 poppler-utils
 fuzzywuzzy
+google-generativeai
+python-dotenv
+"Flask[async]"

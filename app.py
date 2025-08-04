@@ -11,6 +11,13 @@ import tempfile
 import difflib
 import re
 from fuzzywuzzy import fuzz
+from dotenv import load_dotenv
+import google.generativeai as genai
+import asyncio
+
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
 reader = easyocr.Reader(['en'])
@@ -20,9 +27,10 @@ ocr_extracted_texts = []
 last_processed_question_paper_object = None
 
 class QuestionPaper:
-    def __init__(self):
+    def __init__(self, path=None):
         self.questions = []
         self.answers = []
+        self.path = path
 
     def clean_answers(self):
         # Remove unwanted patterns from answers
@@ -44,11 +52,11 @@ class QuestionPaper:
             'answers': self.answers
         }
 
-def clean_and_parse_ocr_text(ocr_text):
+def improved_clean_and_parse_ocr_text(ocr_text):
     """
-    Parse OCR text to extract individual answers
+    Improved parsing with better answer extraction logic
     """
-    # Remove special characters and clean the text
+    # Remove special characters but keep important ones
     cleaned_text = re.sub(r'[|@~¥#$%^&*()_+=\[\]{}\\:";\'<>?,./]', ' ', ocr_text)
     
     # Split by newlines and filter out empty strings
@@ -56,19 +64,23 @@ def clean_and_parse_ocr_text(ocr_text):
     
     individual_answers = []
     
-    for line in lines:
-        # Split by numbers at the beginning (like "1.", "2.", etc.)
-        parts = re.split(r'\d+\.?\s*', line)
-        
-        for part in parts:
-            part = part.strip()
-            if part and len(part) > 1:  # Filter out single characters and empty strings
-                # Further split by multiple spaces
-                words = part.split()
-                for word in words:
-                    word = word.strip()
-                    if len(word) > 2:  # Only consider words with more than 2 characters
-                        individual_answers.append(word)
+    # Try to find numbered patterns first
+    numbered_pattern = re.compile(r'(\d+)\s*[.)]\s*([^0-9]+?)(?=\d+\s*[.)]|$)', re.MULTILINE | re.DOTALL)
+    matches = numbered_pattern.findall(cleaned_text)
+    
+    if matches:
+        # If we found numbered patterns, use them
+        for number, answer in matches:
+            answer = answer.strip()
+            if answer and len(answer) > 1:
+                individual_answers.append(answer)
+    else:
+        # Fallback to line-by-line processing
+        for line in lines:
+            # Remove leading numbers and punctuation
+            cleaned_line = re.sub(r'^\d+\s*[.)]\s*', '', line).strip()
+            if cleaned_line and len(cleaned_line) > 1:
+                individual_answers.append(cleaned_line)
     
     return individual_answers
 
@@ -108,17 +120,26 @@ def easyocr_image():
 
     for image_file in images:
         try:
-            # Read the image file
-            image_np = np.frombuffer(image_file.read(), np.uint8)
-            image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+            # Save the image to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_image_file:
+                image_file.save(temp_image_file.name)
+                temp_path = temp_image_file.name
 
-            # Perform OCR
-            result = reader.readtext(image)
-            
-            # Extract text from the result
-            text = " ".join([item[1] for item in result])
-            extracted_texts.append(text)
-            ocr_extracted_texts.append(text)
+            try:
+                image_np = np.frombuffer(open(temp_path, 'rb').read(), np.uint8)
+                image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+                
+                # Perform OCR
+                result = reader.readtext(image)
+                
+                # Extract text from the result
+                text = " ".join([item[1] for item in result])
+                extracted_texts.append(text)
+                ocr_extracted_texts.append(text)
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
         except Exception as e:
             extracted_texts.append(f"Error processing image with EasyOCR: {str(e)}")
 
@@ -134,13 +155,21 @@ def tesseract_image():
 
     for image_file in images:
         try:
-            # Read the image file and convert to PIL Image
-            image = Image.open(image_file.stream)
+            # Save the image to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_image_file:
+                image_file.save(temp_image_file.name)
+                temp_path = temp_image_file.name
 
-            # Perform OCR using Tesseract
-            text = pytesseract.image_to_string(image)
-            extracted_texts.append(text.strip())
-            ocr_extracted_texts.append(text.strip())
+            try:
+                with Image.open(temp_path) as image:
+                    # Perform OCR using Tesseract
+                    text = pytesseract.image_to_string(image)
+                    extracted_texts.append(text.strip())
+                    ocr_extracted_texts.append(text.strip())
+            finally:
+                # Clean up the temporary file
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
         except Exception as e:
             extracted_texts.append(f"Error processing image with Tesseract: {str(e)}")
 
@@ -160,34 +189,40 @@ def process_question_paper():
     question_paper = QuestionPaper()
     
     try:
+        # Create Images directory if it doesn't exist
+        images_dir = os.path.join(app.root_path, 'Images')
+        os.makedirs(images_dir, exist_ok=True)
+        
         if file.filename.lower().endswith('.pdf'):
-            # Save the uploaded file to a temporary location
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-                file.save(temp_file.name)
-                temp_path = temp_file.name
+            question_paper_filename = "question_paper.pdf"
+            question_paper_path = os.path.join(images_dir, question_paper_filename)
+            file.save(question_paper_path)
             
-            try:
-                # For PDF processing
-                images_from_pdf = convert_from_path(temp_path, poppler_path=r'C:\Program Files\poppler\Library\bin')
+            # Initialize the global object with the path
+            question_paper.path = question_paper_path
+            
+            # For PDF processing
+            images_from_pdf = convert_from_path(question_paper_path, poppler_path=r'C:\Program Files\poppler\Library\bin')
+            
+            for page_image in images_from_pdf:
+                text = pytesseract.image_to_string(page_image)
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
                 
-                for page_image in images_from_pdf:
-                    text = pytesseract.image_to_string(page_image)
-                    lines = [line.strip() for line in text.split('\n') if line.strip()]
-                    
-                    for i, line in enumerate(lines):
-                        if i % 2 == 0:
-                            question_paper.add_question(line)
-                        else:
-                            question_paper.add_answer(line)
-            finally:
-                # Clean up the temporary file
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+                for i, line in enumerate(lines):
+                    if i % 2 == 0:
+                        question_paper.add_question(line)
+                    else:
+                        question_paper.add_answer(line)
         
         else:
             # Process as image
-            image = Image.open(file.stream)
+            question_paper_filename = "question_paper.png"
+            question_paper_path = os.path.join(images_dir, question_paper_filename)
+            file.save(question_paper_path)
             
+            question_paper.path = question_paper_path
+            
+            image = Image.open(question_paper_path)
             text = pytesseract.image_to_string(image)
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             
@@ -208,67 +243,204 @@ def process_question_paper():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/evaluate_answers', methods=['GET'])
+def gemini_evaluate_answer_sheet(question_paper_path, student_answer_path, questions, correct_answers, student_name=None):
+    """
+    Evaluate entire answer sheet using Gemini at once
+    """
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Create the expected answers list for the prompt
+        expected_answers_text = "\n".join([f"{i+1}. {answer}" for i, answer in enumerate(correct_answers)])
+        
+        prompt_text = f"""You are a teacher grading a test for children. 
+        I will provide you with a question paper and a student's answer sheet.
+        
+        Expected correct answers:
+        {expected_answers_text}
+        
+        Instructions:
+        - Compare the student's handwritten answers with the expected answers above
+        - Small spelling mistakes should be ignored and considered correct
+        - If an answer has been crossed out or strikethrough, consider it incorrect
+        - Be lenient with handwriting recognition issues
+        - Look for answers by question numbers (1, 2, 3, etc.)
+        
+        Please evaluate ALL questions and respond in this EXACT JSON format:
+        {{
+            "evaluations": [
+                {{"question_number": 1, "status": "Correct"}},
+                {{"question_number": 2, "status": "Wrong"}},
+                {{"question_number": 3, "status": "Missing"}},
+                ...
+            ]
+        }}
+        
+        For each question, use ONLY one of these three status values:
+        - "Correct" - if the student's answer matches the expected answer (allowing for minor spelling)
+        - "Wrong" - if the student's answer is clearly different from the expected answer  
+        - "Missing" - if no answer is visible for this question number
+        
+        Respond with ONLY the JSON format above, no other text."""
+
+        # Handle PDF vs Image for question paper
+        if question_paper_path.lower().endswith('.pdf'):
+            # Convert PDF to images
+            pdf_images = convert_from_path(question_paper_path, poppler_path=r'C:\Program Files\poppler\Library\bin')
+            question_paper_img = pdf_images[0]  # Use first page
+        else:
+            question_paper_img = Image.open(question_paper_path)
+        
+        # Load student answer image
+        student_answer_img = Image.open(student_answer_path)
+        
+        # Create content for the model
+        content = [prompt_text, question_paper_img, student_answer_img]
+        
+        response = model.generate_content(content)
+        result_text = response.text.strip()
+        
+        print(f"Gemini response: {result_text}")
+        
+        # Try to parse JSON response
+        import json
+        try:
+            # Clean the response - sometimes Gemini adds markdown formatting
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].strip()
+            
+            parsed_result = json.loads(result_text)
+            return parsed_result["evaluations"]
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Failed to parse JSON response: {e}")
+            print(f"Raw response: {result_text}")
+            # Fallback - create default "Error" results
+            return [{"question_number": i+1, "status": "Error"} for i in range(len(correct_answers))]
+            
+    except Exception as e:
+        print(f"Error in Gemini evaluation: {str(e)}")
+        # Return error status for all questions
+        return [{"question_number": i+1, "status": "Error"} for i in range(len(correct_answers))]
+
+@app.route('/evaluate_answers', methods=['POST'])
 def evaluate_answers():
-    if not ocr_extracted_texts:
-        return jsonify({'error': 'No OCR extracted texts available. Please process images first.'}), 400
+    global ocr_extracted_texts
+    if 'student_answers' not in request.files:
+        return jsonify({"error": "Missing student answers"}), 400
+
+    student_answer_files = request.files.getlist('student_answers')
+    student_name = request.form.get('student_name')
+
+    # Retrieve the question paper object
+    question_paper = last_processed_question_paper_object
 
     if last_processed_question_paper_object is None:
-        return jsonify({'error': 'Question paper not processed. Please process a question paper first.'}), 400
+        return jsonify({'error': 'Question paper not found or processed yet'}), 404
 
-    question_paper_answers = last_processed_question_paper_object.answers
-    
-    if not question_paper_answers:
-        return jsonify({'error': 'No correct answers found in question paper.'}), 400
+    student_answer_paths = []
+    try:
+        # Save student answer files temporarily
+        for student_answer_file in student_answer_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_ans_file:
+                student_answer_file.save(temp_ans_file.name)
+                student_answer_paths.append(temp_ans_file.name)
 
-    evaluation_results = []
+        # Traditional OCR evaluation (keep as fallback)
+        ocr_results = []
+        for student_answer_path in student_answer_paths:
+            student_answer_image = Image.open(student_answer_path)
+            student_answer_text = pytesseract.image_to_string(student_answer_image)
+            student_individual_answers = improved_clean_and_parse_ocr_text(student_answer_text)
 
-    for ocr_text in ocr_extracted_texts:
-        # Parse the OCR text to extract individual answers
-        student_answers = clean_and_parse_ocr_text(ocr_text)
-        
-        answer_evaluations = []
-        matched_correct_answers = set()  # To avoid double matching
-        
-        for student_answer in student_answers:
-            # Find available correct answers (not already matched)
-            available_correct_answers = [ans for ans in question_paper_answers if ans not in matched_correct_answers]
-            
-            if available_correct_answers:
-                best_match, score = find_best_match(student_answer, available_correct_answers)
-                
-                if best_match:
-                    matched_correct_answers.add(best_match)
-                    status = "Correct" if score >= 0.8 else "Partially Correct" if score >= 0.6 else "Incorrect"
+            for i, correct_answer in enumerate(question_paper.answers):
+                if i < len(student_individual_answers):
+                    student_ans = student_individual_answers[i]
+                    best_match, score = find_best_match(student_ans, [correct_answer])
+                    
+                    status = "Wrong"
+                    if best_match:
+                        status = "Correct"
+                    
+                    ocr_results.append({
+                        'question_number': i + 1,
+                        'correct_answer': correct_answer,
+                        'student_answer': student_ans,
+                        'status': status,
+                        'similarity_score': score
+                    })
                 else:
-                    status = "No Match"
-                
-                answer_evaluations.append({
-                    'student_answer': student_answer,
-                    'matched_correct_answer': best_match,
-                    'similarity_score': round(score, 3),
-                    'status': status
-                })
-        
-        # Calculate overall statistics
-        total_answers = len(answer_evaluations)
-        correct_count = len([eval for eval in answer_evaluations if eval['status'] == 'Correct'])
-        partially_correct_count = len([eval for eval in answer_evaluations if eval['status'] == 'Partially Correct'])
-        
-        evaluation_results.append({
-            'raw_ocr_text': ocr_text,
-            'parsed_student_answers': student_answers,
-            'individual_evaluations': answer_evaluations,
-            'summary': {
-                'total_answers_found': total_answers,
-                'correct_answers': correct_count,
-                'partially_correct_answers': partially_correct_count,
-                'incorrect_answers': total_answers - correct_count - partially_correct_count,
-                'accuracy_percentage': round((correct_count / total_answers * 100) if total_answers > 0 else 0, 2)
-            }
-        })
+                    ocr_results.append({
+                        'question_number': i + 1,
+                        'correct_answer': correct_answer,
+                        'student_answer': 'N/A',
+                        'status': 'Missing',
+                        'similarity_score': 0
+                    })
 
-    return jsonify({'evaluation_results': evaluation_results})
+        # Gemini evaluation (main evaluation method)
+        gemini_results = []
+        if question_paper.path and os.path.exists(question_paper.path):
+            print("Starting Gemini evaluation...")
+            
+            # Process each student answer sheet once
+            for idx, student_answer_path in enumerate(student_answer_paths):
+                print(f"Evaluating answer sheet {idx + 1} with Gemini...")
+                
+                # Get evaluation for entire answer sheet at once
+                sheet_evaluations = gemini_evaluate_answer_sheet(
+                    question_paper.path, 
+                    student_answer_path, 
+                    question_paper.questions,
+                    question_paper.answers,
+                    student_name
+                )
+                
+                # Process the results and add question details
+                for eval_result in sheet_evaluations:
+                    question_num = eval_result["question_number"]
+                    if 1 <= question_num <= len(question_paper.questions):
+                        gemini_results.append({
+                            'question_number': question_num,
+                            'question_text': question_paper.questions[question_num - 1],
+                            'correct_answer': question_paper.answers[question_num - 1],
+                            'status': eval_result["status"],
+                            'answer_sheet': idx + 1  # Track which answer sheet this is from
+                        })
+            
+            # Calculate summary
+            correct_count = sum(1 for result in gemini_results if result['status'] == 'Correct')
+            total_questions = len(gemini_results)
+            score_percentage = (correct_count / total_questions) * 100 if total_questions > 0 else 0
+            
+            final_results = {
+                'student_name': student_name,
+                'total_questions': len(question_paper.answers),
+                'total_answer_sheets': len(student_answer_paths),
+                'correct_answers': correct_count,
+                'wrong_answers': sum(1 for result in gemini_results if result['status'] == 'Wrong'),
+                'missing_answers': sum(1 for result in gemini_results if result['status'] == 'Missing'),
+                'error_answers': sum(1 for result in gemini_results if result['status'] == 'Error'),
+                'score_percentage': round(score_percentage, 2),
+                'gemini_evaluation_results': gemini_results,
+                'ocr_evaluation_results': ocr_results  # Keep as reference
+            }
+            
+            return jsonify(final_results)
+        else:
+            return jsonify({
+                'ocr_evaluation_results': ocr_results, 
+                'gemini_evaluation_warning': 'Question paper file not found for Gemini evaluation.'
+            })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        # Clean up temporary student answer files
+        for path in student_answer_paths:
+            if os.path.exists(path):
+                os.unlink(path)
 
 @app.route('/debug_parsing', methods=['GET'])
 def debug_parsing():
@@ -281,7 +453,7 @@ def debug_parsing():
     debug_results = []
     
     for ocr_text in ocr_extracted_texts:
-        parsed_answers = clean_and_parse_ocr_text(ocr_text)
+        parsed_answers = improved_clean_and_parse_ocr_text(ocr_text)
         debug_results.append({
             'original_ocr_text': ocr_text,
             'parsed_answers': parsed_answers

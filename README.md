@@ -76,3 +76,15 @@ curl -X POST -F "file=@/path/to/your/question_paper.png" http://127.0.0.1:5000/p
 ```bash
 curl -X POST -F "file=@/path/to/your/question_paper.pdf" http://127.0.0.1:5000/process_question_paper
 ```
+
+### `GET /evaluate_answers`
+
+Compares OCR extracted texts with the answers from the last processed question paper.
+
+**Request:** None (GET request).
+
+**Example (curl):**
+
+```bash
+curl -X GET http://127.0.0.1:5000/evaluate_answers
+```
