@@ -88,7 +88,3 @@ Compares OCR extracted texts with the answers from the last processed question p
 ```bash
 curl -X GET http://127.0.0.1:5000/evaluate_answers
 ```
-<<<<<<< HEAD
-=======
-
->>>>>>> 5c2f58c09ade96fac378cf71ec766507a042e561
